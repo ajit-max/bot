@@ -5,6 +5,5 @@ requests
 TA-Lib
 logzero
 websocket
-pandas_ta
 Flask
 gunicorn
