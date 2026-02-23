@@ -1,0 +1,5 @@
+pandas
+smartapi-python
+pyotp
+requests
+TA-Lib
