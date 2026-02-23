@@ -1,13 +1,29 @@
 import pandas as pd
 import datetime as dt
-import talib
+import pandas_ta as ta  # <-- TA-Lib ki jagah ye
 import time
 import requests
 import pyotp
 import warnings
+import threading
+import os
+from flask import Flask
 from SmartApi import SmartConnect
 
 warnings.filterwarnings("ignore")
+
+# ================= DUMMY SERVER FOR RENDER =================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is Running 24/7!"
+
+def run_web():
+    # Render PORT environment variable use karega, ya default 10000
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+# ===========================================================
 
 # ================= CONFIG =================
 API_KEY = "yRe368gf"
@@ -24,12 +40,11 @@ CAPITAL = 50000
 RISK_PER_TRADE = 0.02
 DAILY_MAX_LOSS_PCT = 0.05
 MAX_DRAWDOWN_PCT = 0.10
-PAPER_TRADE = True
+PAPER_TRADE = True  # <--- Change to False for Real Trade
 # ==========================================
 
 instrument_list = None
 initial_capital = CAPITAL
-
 
 # ================= TELEGRAM =================
 def send_telegram(msg):
@@ -39,29 +54,39 @@ def send_telegram(msg):
     except:
         pass
 
-
 # ================= MASTER =================
 def get_instrument_master():
     global instrument_list
     url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/v1/instrumentsJSON.json"
-    res = requests.get(url).json()
-    instrument_list = pd.DataFrame(res)
-    instrument_list['expiry'] = pd.to_datetime(instrument_list['expiry'], errors='coerce')
-
+    try:
+        # Timeout add kiya taaki hang na ho
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            instrument_list = pd.DataFrame(data)
+            instrument_list['expiry'] = pd.to_datetime(instrument_list['expiry'], errors='coerce')
+            print("✅ Instrument Master Downloaded")
+        else:
+            print("❌ Master Download Failed")
+    except Exception as e:
+        print(f"⚠️ Master Error: {e}")
 
 # ================= CONNECTION =================
 def connect():
-    obj = SmartConnect(api_key=API_KEY)
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    session = obj.generateSession(CLIENT_ID, PASSWORD, totp)
-    if not session["status"]:
-        raise Exception("Login Failed")
-    return obj
-
+    try:
+        obj = SmartConnect(api_key=API_KEY)
+        totp = pyotp.TOTP(TOTP_SECRET).now()
+        session = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+        if not session["status"]:
+            return None
+        return obj
+    except:
+        return None
 
 # ================= OPTION FETCH =================
 def get_atm_option(spot_price, opt_type):
     global instrument_list
+    if instrument_list is None: return None, None
 
     strike = round(spot_price / 50) * 50
 
@@ -78,7 +103,6 @@ def get_atm_option(spot_price, opt_type):
         return None, None
 
     return df.iloc[0]['token'], df.iloc[0]['symbol']
-
 
 # ================= ORDER =================
 def place_order(obj, symbol, token, qty, side):
@@ -104,53 +128,53 @@ def place_order(obj, symbol, token, qty, side):
         print("Order Error:", e)
         return False
 
-
 # ================= ENGINE =================
 def run_engine():
+    global CAPITAL, instrument_list, initial_capital
 
-    global CAPITAL
-
+    print("🔌 Connecting to Angel One...")
     obj = connect()
-    get_instrument_master()
+    if not obj:
+        print("❌ Connection Failed. Retrying in 10s...")
+        time.sleep(10)
+        return
 
+    get_instrument_master()
+    
     trade_active = False
     trade = {}
     daily_pnl = 0
     current_day = dt.datetime.now().date()
 
-    print("🔥 10/10 ENGINE RUNNING")
+    send_telegram("🔥 Bot Started on Render!")
+    print("🔥 ENGINE RUNNING")
 
     while True:
-
         now = dt.datetime.now()
 
-        # Candle sync (5 min close only)
-        if now.minute % 5 != 0 or now.second > 8:
-            time.sleep(2)
-            continue
-
-        # Reset daily
-        if current_day != now.date():
-            daily_pnl = 0
-            current_day = now.date()
-            get_instrument_master()
-
-        # Daily loss lock
-        if daily_pnl <= -(CAPITAL * DAILY_MAX_LOSS_PCT):
-            print("❌ Daily Loss Limit Hit")
-            time.sleep(300)
-            continue
-
-        # Hard capital drawdown stop
-        if CAPITAL + daily_pnl <= initial_capital * (1 - MAX_DRAWDOWN_PCT):
-            print("🚨 Max Drawdown Hit. Engine Stopped.")
-            break
-
-        if not (dt.time(9,20) <= now.time() <= dt.time(15,10)):
-            time.sleep(10)
+        # Market Time Check (9:15 to 3:30)
+        if not (dt.time(9,15) <= now.time() <= dt.time(15,30)):
+            print(f"💤 Market Closed [{now.strftime('%H:%M:%S')}]")
+            time.sleep(60) # 1 min wait in closed market
             continue
 
         try:
+            # Candle sync (5 min close only)
+            if now.minute % 5 != 0:
+                time.sleep(1)
+                continue
+            
+            # Reset daily
+            if current_day != now.date():
+                daily_pnl = 0
+                current_day = now.date()
+                get_instrument_master()
+
+            # Daily loss lock
+            if daily_pnl <= -(initial_capital * DAILY_MAX_LOSS_PCT):
+                print("❌ Daily Loss Limit Hit")
+                time.sleep(300)
+                continue
 
             # ===== SPOT DATA =====
             res = obj.getCandleData({
@@ -162,21 +186,30 @@ def run_engine():
             })
 
             if not res["status"] or not res["data"]:
+                time.sleep(10)
                 continue
 
             df = pd.DataFrame(res["data"], columns=['date','o','h','l','c','v'])
             df[['h','l','c']] = df[['h','l','c']].astype(float)
 
-            if len(df) < 210:
+            if len(df) < 201:
+                print("⚠️ Waiting for more candles...")
+                time.sleep(10)
                 continue
 
-            spot = df['c'].iloc[-2]
-            ema200 = talib.EMA(df['c'], 200).iloc[-2]
-            rsi = talib.RSI(df['c'], 14).iloc[-2]
+            # --- PANDAS_TA INDICATORS ---
+            # TA-Lib ki jagah pandas_ta use kar rahe hain
+            df['ema200'] = df.ta.ema(close='c', length=200)
+            df['rsi'] = df.ta.rsi(close='c', length=14)
+
+            spot = df['c'].iloc[-2] # Previous closed candle
+            ema200 = df['ema200'].iloc[-2]
+            rsi = df['rsi'].iloc[-2]
+
+            print(f"🔍 Spot: {spot} | EMA: {round(ema200,2)} | RSI: {round(rsi,2)}")
 
             # ===== ENTRY =====
             if not trade_active:
-
                 direction = None
                 if spot > ema200 and rsi > 60:
                     direction = "CE"
@@ -184,137 +217,89 @@ def run_engine():
                     direction = "PE"
 
                 if direction:
-
                     token, symbol = get_atm_option(spot, direction)
-                    if not token:
-                        continue
+                    if not token: continue
 
                     ltp_res = obj.ltpData("NFO", symbol, token)
-                    if not ltp_res["status"]:
-                        continue
-
+                    if not ltp_res["status"]: continue
                     opt_ltp = float(ltp_res["data"]["ltp"])
 
-                    # ===== OPTION ATR FOR SL =====
+                    # ATR Calculation for Option
                     opt_candle = obj.getCandleData({
-                        "exchange": "NFO",
-                        "symboltoken": token,
-                        "interval": "FIVE_MINUTE",
+                        "exchange": "NFO", "symboltoken": token, "interval": "FIVE_MINUTE",
                         "fromdate": (now - dt.timedelta(days=3)).strftime("%Y-%m-%d 09:15"),
                         "todate": now.strftime("%Y-%m-%d %H:%M")
                     })
-
-                    opt_df = pd.DataFrame(opt_candle["data"], columns=['date','o','h','l','c','v'])
-                    opt_df[['h','l','c']] = opt_df[['h','l','c']].astype(float)
-
-                    opt_atr = talib.ATR(opt_df['h'], opt_df['l'], opt_df['c'], 14).iloc[-2]
+                    
+                    if opt_candle['status'] and opt_candle['data']:
+                        opt_df = pd.DataFrame(opt_candle["data"], columns=['date','o','h','l','c','v'])
+                        opt_df[['h','l','c']] = opt_df[['h','l','c']].astype(float)
+                        # Pandas_TA ATR
+                        opt_df['atr'] = opt_df.ta.atr(high='h', low='l', close='c', length=14)
+                        opt_atr = opt_df['atr'].iloc[-2]
+                    else:
+                        opt_atr = 10 # Default fallback
 
                     sl_points = opt_atr * 1.5
                     sl_price = opt_ltp - sl_points
-
-                    risk_amt = CAPITAL * RISK_PER_TRADE
+                    risk_amt = initial_capital * RISK_PER_TRADE
                     risk_per_lot = sl_points * LOT_SIZE
-
                     lots = int(risk_amt // risk_per_lot)
-
-                    if lots < 1:
-                        continue
-
+                    
+                    if lots < 1: lots = 1 # Minimum 1 lot
                     qty = lots * LOT_SIZE
 
                     if place_order(obj, symbol, token, qty, "BUY"):
-
                         trade = {
-                            "symbol": symbol,
-                            "token": token,
-                            "entry": opt_ltp,
-                            "sl": sl_price,
-                            "tgt1": opt_ltp + (sl_points * 1.5),
-                            "tgt2": opt_ltp + (sl_points * 3),
-                            "qty": qty,
-                            "remaining_qty": qty,
-                            "partial_done": False,
-                            "pnl_booked": 0
+                            "symbol": symbol, "token": token, "entry": opt_ltp,
+                            "sl": sl_price, "tgt1": opt_ltp + (sl_points * 1.5),
+                            "tgt2": opt_ltp + (sl_points * 3), "qty": qty,
+                            "remaining_qty": qty, "partial_done": False, "pnl_booked": 0
                         }
-
                         trade_active = True
-
-                        send_telegram(
-                            f"🟢 BUY {symbol}\n"
-                            f"Entry: {round(opt_ltp,2)}\n"
-                            f"SL: {round(sl_price,2)}\n"
-                            f"Qty: {qty}"
-                        )
+                        send_telegram(f"🟢 BUY {symbol}\nEntry: {opt_ltp}\nSL: {sl_price}\nQty: {qty}")
 
             # ===== EXIT =====
             else:
-
                 ltp_res = obj.ltpData("NFO", trade["symbol"], trade["token"])
-                if not ltp_res["status"]:
-                    continue
+                if ltp_res["status"]:
+                    curr_ltp = float(ltp_res["data"]["ltp"])
+                    
+                    # Target 1 Logic
+                    if not trade["partial_done"] and curr_ltp >= trade["tgt1"]:
+                        exit_qty = trade["qty"] // 2
+                        if place_order(obj, trade["symbol"], trade["token"], exit_qty, "SELL"):
+                            trade["pnl_booked"] += (curr_ltp - trade["entry"]) * exit_qty
+                            trade["remaining_qty"] -= exit_qty
+                            trade["partial_done"] = True
+                            trade["sl"] = trade["entry"] # SL to Cost
+                            send_telegram("💰 Partial Booked | SL to Cost")
 
-                curr_ltp = float(ltp_res["data"]["ltp"])
+                    # Final Exit Logic
+                    reason = None
+                    if curr_ltp <= trade["sl"]: reason = "STOPLOSS"
+                    elif curr_ltp >= trade["tgt2"]: reason = "TARGET HIT"
+                    elif now.time() >= dt.time(15,15): reason = "EOD EXIT"
 
-                # Partial
-                if not trade["partial_done"] and curr_ltp >= trade["tgt1"]:
-                    exit_qty = trade["qty"] // 2
-                    if place_order(obj, trade["symbol"], trade["token"], exit_qty, "SELL"):
-                        trade["pnl_booked"] += (curr_ltp - trade["entry"]) * exit_qty
-                        trade["remaining_qty"] -= exit_qty
-                        trade["partial_done"] = True
-                        trade["sl"] = trade["entry"]
-
-                        send_telegram("💰 Partial Booked | SL to Cost")
-
-                reason = None
-                if curr_ltp <= trade["sl"]:
-                    reason = "STOPLOSS"
-                elif curr_ltp >= trade["tgt2"]:
-                    reason = "TARGET HIT"
-                elif now.time() >= dt.time(15,15):
-                    reason = "EOD EXIT"
-
-                if reason:
-
-                    exit_qty = trade["remaining_qty"]
-
-                    if place_order(obj, trade["symbol"], trade["token"], exit_qty, "SELL"):
-
-                        pnl_final = (curr_ltp - trade["entry"]) * exit_qty
-                        total_trade_pnl = trade["pnl_booked"] + pnl_final
-                        daily_pnl += total_trade_pnl
-
-                        # ===== JOURNAL =====
-                        log = {
-                            "Date": now,
-                            "Symbol": trade["symbol"],
-                            "Entry": trade["entry"],
-                            "Exit": curr_ltp,
-                            "PnL": total_trade_pnl,
-                            "DayPnL": daily_pnl
-                        }
-
-                        pd.DataFrame([log]).to_csv(
-                            "trade_log.csv",
-                            mode="a",
-                            header=not pd.io.common.file_exists("trade_log.csv"),
-                            index=False
-                        )
-
-                        send_telegram(
-                            f"🔚 {reason}\n"
-                            f"Exit: {round(curr_ltp,2)}\n"
-                            f"Trade PnL: ₹{round(total_trade_pnl,2)}\n"
-                            f"Day PnL: ₹{round(daily_pnl,2)}"
-                        )
-
-                        trade_active = False
+                    if reason:
+                        if place_order(obj, trade["symbol"], trade["token"], trade["remaining_qty"], "SELL"):
+                            pnl = (curr_ltp - trade["entry"]) * trade["remaining_qty"]
+                            total_pnl = trade["pnl_booked"] + pnl
+                            daily_pnl += total_pnl
+                            send_telegram(f"🔚 {reason}\nExit: {curr_ltp}\nTrade PnL: {total_pnl}")
+                            trade_active = False
 
         except Exception as e:
-            print("Loop Error:", e)
-
-        time.sleep(2)
-
+            print(f"⚠️ Loop Error: {e}")
+            time.sleep(5)
+        
+        # Har 60 sec wait karo loop mein (Candle close logic handle ho raha hai upar)
+        time.sleep(60)
 
 if __name__ == "__main__":
+    # Flask ko alag thread mein start karo taaki bot ruke nahi
+    t = threading.Thread(target=run_web)
+    t.start()
+    
+    # Main Bot Engine
     run_engine()
